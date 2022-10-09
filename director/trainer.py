@@ -6,7 +6,7 @@ import os
 from dreamerv2.utils.module import get_parameters, FreezeParameters
 from dreamerv2.utils.algorithm import compute_return
 
-from dreamerv2.models.actor import DiscreteActionModel
+from director.actor import DiscreteActionModel
 from dreamerv2.models.dense import DenseModel
 from dreamerv2.models.rssm import RSSM
 from dreamerv2.models.pixel import ObsDecoder, ObsEncoder
@@ -61,6 +61,7 @@ class Trainer(object):
         value_l = []
         obs_l = []
         model_l = []
+        goal_vae_l = []
         reward_l = []
         prior_ent_l = []
         post_ent_l = []
@@ -104,6 +105,20 @@ class Trainer(object):
             )
             self.model_optimizer.step()
 
+
+            self.goal_vae_optimizer.zero_grad()
+            post_modelstate = self.RSSM.get_model_state(posterior).detach()
+            goal_embedding, goal_logit = self.GoalVAE.encode(post_modelstate)
+            goal_reconstruction = self.GoalVAE.decode(goal_embedding)
+            goal_loss = self.GoalVAE.loss(
+                post_modelstate,
+                goal_reconstruction,
+                goal_logit,
+            )
+            goal_loss.backward()
+            self.goal_vae_optimizer.step()
+
+
             actor_loss, value_loss, target_info = self.actorcritc_loss(posterior)
 
             self.actor_optimizer.zero_grad()
@@ -132,6 +147,7 @@ class Trainer(object):
             value_l.append(value_loss.item())
             obs_l.append(obs_loss.item())
             model_l.append(model_loss.item())
+            goal_vae_l.append(goal_loss.item())
             reward_l.append(reward_loss.item())
             kl_l.append(kl_loss.item())
             pcont_l.append(pcont_loss.item())
@@ -141,6 +157,7 @@ class Trainer(object):
             std_targ.append(target_info["std_targ"])
 
         train_metrics["model_loss"] = np.mean(model_l)
+        train_metrics["goal_vae_loss"] = np.mean(goal_vae_l)
         train_metrics["kl_loss"] = np.mean(kl_l)
         train_metrics["reward_loss"] = np.mean(reward_l)
         train_metrics["obs_loss"] = np.mean(obs_l)
@@ -174,7 +191,6 @@ class Trainer(object):
             )
 
         imag_modelstates = self.RSSM.get_model_state(imag_rssm_states)
-        import pdb;pdb.set_trace()
         with FreezeParameters(
             self.world_list
             + self.value_list
@@ -397,6 +413,12 @@ class Trainer(object):
             config.rssm_type,
             config.rssm_info,
         ).to(self.device)
+        goal_vae_latents, goal_vae_classes = 20, 20
+        self.GoalVAE = GoalAutoencoder(
+            config.rssm_info["deter_size"] + config.rssm_info["stoch_size"],
+            goal_vae_latents,
+            goal_vae_classes,
+        ).to(self.device)
         self.ActionModel = DiscreteActionModel(
             action_size,
             deter_size,
@@ -404,6 +426,9 @@ class Trainer(object):
             embedding_size,
             config.actor,
             config.expl,
+            lambda state: self.GoalVAE.encode(state),
+            goal_vae_latents,
+            goal_vae_classes,
         ).to(self.device)
         self.RewardDecoder = DenseModel((1,), modelstate_size, config.reward).to(
             self.device
@@ -445,6 +470,7 @@ class Trainer(object):
             self.RewardDecoder,
             self.ObsDecoder,
             self.DiscountModel,
+            self.GoalVAE,
         ]
         self.actor_list = [self.ActionModel]
         self.value_list = [self.ValueModel]
@@ -452,6 +478,7 @@ class Trainer(object):
         self.model_optimizer = optim.Adam(get_parameters(self.world_list), model_lr)
         self.actor_optimizer = optim.Adam(get_parameters(self.actor_list), actor_lr)
         self.value_optimizer = optim.Adam(get_parameters(self.value_list), value_lr)
+        self.goal_vae_optimizer = optim.Adam(self.GoalVAE.parameters(), 3e-4)
 
     def _print_summary(self):
         print("\n Obs encoder: \n", self.ObsEncoder)

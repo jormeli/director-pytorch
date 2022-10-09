@@ -76,7 +76,7 @@ def main(args):
         best_mean_score = 0
         train_episodes = 0
         best_save_path = os.path.join(model_dir, 'models_best.pth')
-        for iter in tqdm(range(1, trainer.config.train_steps)):
+        for iter in range(1, trainer.config.train_steps):
             if iter%trainer.config.train_every == 0:
                 train_metrics = trainer.train_batch(train_metrics)
             if iter%trainer.config.slow_target_update == 0:
