@@ -1,0 +1,18 @@
+version: "3.3"
+services:
+  train:
+    build: .
+    command:
+      ["python", "pomdp.py"]
+    environment: &dev_environment
+      APP_ENV: development
+    volumes:
+      - .:/app
+
+  lint:
+    build: .
+    command: ["flake8"]
+
+  test:
+    build: .
+    command: ["pytest", "-v"]

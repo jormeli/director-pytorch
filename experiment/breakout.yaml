@@ -1,0 +1,26 @@
+defaults:
+    - experiment_config
+
+environment: minatar:breakout
+device: CUDA
+training_cfg:
+    sequence_length: 50
+    batch_size: 50
+    train_every: 16
+    train_steps: 50000000
+    horizon: 16
+    seed_steps: 1000
+    slow_target_update: 100
+    goal_duration: 8
+    save_every: 100000
+goal_vae_cfg:
+    n_latents: 8
+    n_classes: 8
+    encoder_cfg:
+        n_layers: 3
+        layer_size: 512
+    decoder_cfg:
+        n_layers: 3
+        layer_size: 512
+worker_cfg:
+    action_noise: false
