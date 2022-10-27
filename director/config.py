@@ -28,6 +28,12 @@ class GoalAutoencoderConfig:
 @dataclass
 class WorkerConfig:
     action_noise: bool
+    slow_target_mix: float
+
+
+@dataclass
+class ManagerConfig:
+    slow_target_mix: float
 
 
 @dataclass
@@ -48,6 +54,7 @@ class ExperimentConfig:
     training_cfg: TrainingConfig
     goal_vae_cfg: GoalAutoencoderConfig
     worker_cfg: WorkerConfig
+    manager_cfg: ManagerConfig
     environment: str
     device: Device
     seed: Optional[int] = 609

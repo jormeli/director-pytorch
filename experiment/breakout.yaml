@@ -10,7 +10,7 @@ training_cfg:
     train_steps: 50000000
     horizon: 16
     seed_steps: 1000
-    slow_target_update: 100
+    slow_target_update: 1
     goal_duration: 8
     save_every: 100000
 goal_vae_cfg:
@@ -24,3 +24,6 @@ goal_vae_cfg:
         layer_size: 512
 worker_cfg:
     action_noise: false
+    slow_target_mix: 0.001
+manager_cfg:
+    slow_target_mix: 0.001

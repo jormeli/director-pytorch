@@ -70,6 +70,7 @@ class Manager(nn.Module):
         n_classes: int,
         n_layers: int,
         layer_size: int,
+        slow_target_mix: float,
     ):
         super().__init__()
 
@@ -90,14 +91,14 @@ class Manager(nn.Module):
             output_size=1,
             n_layers=n_layers,
             layer_size=layer_size,
-            slow_target_mix=1.0,
+            slow_target_mix=slow_target_mix,
         )
         self.intrinsic_critic = Critic(
             input_size=input_size,
             output_size=1,
             n_layers=n_layers,
             layer_size=layer_size,
-            slow_target_mix=1.0,
+            slow_target_mix=slow_target_mix,
         )
 
     def get_action(self, model_state: torch.Tensor) -> torch.Tensor:
@@ -167,6 +168,7 @@ class Worker(nn.Module):
         action_size: int,
         n_layers: int,
         layer_size: int,
+        slow_target_mix: float,
     ):
         super().__init__()
         self.input_size = input_size
@@ -188,7 +190,7 @@ class Worker(nn.Module):
             output_size=1,
             n_layers=n_layers,
             layer_size=layer_size,
-            slow_target_mix=1.0,
+            slow_target_mix=slow_target_mix,
         )
 
     def get_action(

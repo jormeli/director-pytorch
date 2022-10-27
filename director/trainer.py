@@ -8,6 +8,7 @@ from dreamerv2.models.dense import DenseModel
 from dreamerv2.models.rssm import RSSM
 from dreamerv2.models.pixel import ObsDecoder, ObsEncoder
 from dreamerv2.utils.buffer import TransitionBuffer
+from director.config import ExperimentConfig
 from director.policy import Manager, Worker
 from director.goal_autoencoder import GoalAutoencoder
 from director.utils import (
@@ -23,7 +24,9 @@ class Trainer(object):
         self,
         config,
         device,
+        cfg: ExperimentConfig,
     ):
+        self.cfg = cfg
         config.rssm_type = "continuous"
 
         self.goal_vae_latents, self.goal_vae_classes = 8, 8
@@ -603,12 +606,14 @@ class Trainer(object):
             self.goal_vae_classes,
             n_layers=4,
             layer_size=512,
+            slow_target_mix=self.cfg.manager_cfg.slow_target_mix,
         ).to(self.device)
         self.worker = Worker(
             2 * (config.rssm_info["deter_size"] + config.rssm_info["stoch_size"]),
             action_size,
             n_layers=4,
             layer_size=512,
+            slow_target_mix=self.cfg.worker_cfg.slow_target_mix,
         ).to(self.device)
 
         if config.discount["use"]:

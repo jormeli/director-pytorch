@@ -128,7 +128,7 @@ def run(cfg):
     goal_duration = cfg.training_cfg.goal_duration
 
     config_dict = config.__dict__
-    trainer = Trainer(config, device)
+    trainer = Trainer(config, device, cfg)
     trainer.goal_duration = goal_duration
 
     with wandb.init(project="Director", config=config_dict):
