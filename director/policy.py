@@ -38,20 +38,19 @@ class Critic(nn.Module):
 
     def loss(
         self,
-        imagined_model_states: torch.Tensor,
+        imag_modelstates: torch.Tensor,
         discount_arr: torch.Tensor,
         lambda_returns: torch.Tensor,
     ) -> torch.Tensor:
+        discount_arr = torch.cat([torch.ones_like(discount_arr[:1]), discount_arr[1:]])
         discount = torch.cumprod(discount_arr[:-1], 0)
         with torch.no_grad():
-            value_model_states = imagined_model_states[:-1].detach()
+            value_modelstates = imag_modelstates[:-1].detach()
             value_discount = discount.detach()
-            value_target = lambda_returns[:-1].detach()
+            value_target = lambda_returns.detach()
 
-        value_dist = self.net(value_model_states)
-        value_loss = -torch.mean(
-            value_discount * value_dist.log_prob(value_target).unsqueeze(-1)
-        )
+        value_dist = self.value(value_modelstates)
+        value_loss = -torch.mean(value_discount*value_dist.log_prob(value_target).unsqueeze(-1))
         return value_loss
 
     def update_target(self):
@@ -109,32 +108,20 @@ class Manager(nn.Module):
 
     def actor_loss(
         self,
-        ext_lambda_returns: torch.Tensor,
-        int_lambda_returns: torch.Tensor,
+        lambda_returns: torch.Tensor,
         discount_arr: torch.Tensor,
         policy_entropy: torch.Tensor,
-        ext_value: torch.Tensor,
-        int_value: torch.Tensor,
+        imag_value: torch.Tensor,
         imag_log_prob: torch.Tensor,
     ) -> torch.Tensor:
-        with torch.no_grad():
-            if self.grad == "reinforce":
-                ext_advantage = (ext_lambda_returns - ext_value).detach()
-                int_advantage = (int_lambda_returns - int_value).detach()
-                advantage = ext_advantage + int_advantage * 0.1
-                objective = imag_log_prob.unsqueeze(-1) * advantage
-            else:
-                objective = ext_lambda_returns + int_lambda_returns * 0.1
+        advantage = (lambda_returns-imag_value[:-1]).detach()
+        objective = imag_log_prob[1:].unsqueeze(-1) * advantage
 
-        policy_entropy = policy_entropy[:-1].unsqueeze(-1)
-        actor_loss = -torch.sum(
-            torch.mean(
-                (objective + self.actor_entropy_scale * policy_entropy),
-                dim=1,
-            )
-        )
-
-        return actor_loss
+        discount_arr = torch.cat([torch.ones_like(discount_arr[:1]), discount_arr[1:]])
+        discount = torch.cumprod(discount_arr[:-1], 0)
+        policy_entropy = policy_entropy[1:].unsqueeze(-1)
+        actor_loss = -torch.sum(torch.mean(discount * (objective + self.actor_entropy_scale * policy_entropy), dim=1))
+        return actor_loss, discount, lambda_returns
 
     def extrinsic_critic_loss(
         self,
@@ -181,7 +168,7 @@ class Worker(nn.Module):
         self.noise_amount = 0.1
 
         self.actor = nn.Sequential(
-            Dense(input_size, action_size, layer_size, n_layers),
+            Dense(input_size * 2, action_size, layer_size, n_layers),
             OneHot(action_size),
         )
 
@@ -193,11 +180,15 @@ class Worker(nn.Module):
             slow_target_mix=slow_target_mix,
         )
 
+    def forward(self, x):
+        return self.actor(x)
+
     def get_action(
         self,
         model_state: torch.Tensor,
         goal: torch.Tensor,
     ):
+        #return self.actor(model_state)
         return self.actor(torch.cat([model_state, goal], dim=-1))
 
     def value_loss(
@@ -220,19 +211,11 @@ class Worker(nn.Module):
         imag_value: torch.Tensor,
         imag_log_prob: torch.Tensor,
     ) -> torch.Tensor:
-        with torch.no_grad():
-            if self.grad == "reinforce":
-                advantage = (lambda_returns - imag_value).detach()
-                objective = imag_log_prob.unsqueeze(-1) * advantage
-            else:
-                objective = lambda_returns
+        advantage = (lambda_returns-imag_value[:-1]).detach()
+        objective = imag_log_prob[1:].unsqueeze(-1) * advantage
 
-        policy_entropy = policy_entropy.unsqueeze(-1)
-        actor_loss = -torch.sum(
-            torch.mean(
-                (objective + self.actor_entropy_scale * policy_entropy),
-                dim=1,
-            )
-        )
-
-        return actor_loss
+        discount_arr = torch.cat([torch.ones_like(discount_arr[:1]), discount_arr[1:]])
+        discount = torch.cumprod(discount_arr[:-1], 0)
+        policy_entropy = policy_entropy[1:].unsqueeze(-1)
+        actor_loss = -torch.sum(torch.mean(discount * (objective + self.actor_entropy_scale * policy_entropy), dim=1))
+        return actor_loss, discount, lambda_returns

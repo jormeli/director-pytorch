@@ -29,11 +29,13 @@ class GoalAutoencoderConfig:
 class WorkerConfig:
     action_noise: bool
     slow_target_mix: float
+    extrinsic_reward: bool
 
 
 @dataclass
 class ManagerConfig:
     slow_target_mix: float
+    intrinsic_reward: bool
 
 
 @dataclass

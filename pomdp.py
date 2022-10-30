@@ -1,5 +1,6 @@
 from datetime import datetime
 import wandb
+import logging
 import os
 import torch
 import numpy as np
@@ -18,12 +19,14 @@ from dreamerv2.utils.wrapper import (
 from dreamerv2.training.config import MinAtarConfig
 
 from director.config import ExperimentConfig, Device
+from director.log import configure_logging
 from director.trainer import Trainer
 from director.utils import VectorOfCategoricals
 
 import hydra
 from omegaconf import OmegaConf
 from torchvision.utils import make_grid
+import tqdm
 
 pomdp_wrappers = {
     "breakout": breakoutPOMDP,
@@ -88,6 +91,7 @@ def action_noise(action, itr):
 
 
 def run(cfg):
+    configure_logging(use_json=False)
     wandb.login()
     env_name = cfg.environment
     exp_id = datetime.now().isoformat() + "_pomdp"
@@ -95,6 +99,7 @@ def run(cfg):
     result_dir = os.path.join("results", "{}_{}".format(env_name, exp_id))
     model_dir = os.path.join(result_dir, "models")  # dir to save learnt models
     os.makedirs(model_dir, exist_ok=True)
+    best_save_path = os.path.join(model_dir, "best_model.pth")
 
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
@@ -102,7 +107,7 @@ def run(cfg):
         assert torch.cuda.is_available()
 
     device = torch.device(cfg.device)
-    print("Using device:", device)
+    logging.info(f"Using device: {device}")
 
     env, obs_shape, action_size, obs_dtype, action_dtype = make_env(cfg)
     batch_size = cfg.training_cfg.batch_size
@@ -132,7 +137,7 @@ def run(cfg):
     trainer.goal_duration = goal_duration
 
     with wandb.init(project="Director", config=config_dict):
-        print("Training...")
+        logging.info("Training...")
         train_metrics = {}
         trainer.collect_seed_episodes(env)
         obs, score = env.reset(), 0
@@ -152,6 +157,7 @@ def run(cfg):
         state_dec_hist = []
         obs_hist = []
         grid = None
+        progress = tqdm.tqdm(total=trainer.config.train_steps, desc="Training")
 
         for iter in range(1, trainer.config.train_steps):
             obs = obs.astype(np.float32)
@@ -181,13 +187,13 @@ def run(cfg):
                         logits
                     )  # used for logging
                     goal, _ = trainer.GoalVAE.decode(goal)
+                    goal_ent = torch.mean(goal_dist.entropy()).item()
+                    episode_goal_ent.append(goal_ent)
 
                 # Used for logging
                 state_enc, _ = trainer.GoalVAE.encode(model_state)
                 state_dec, _ = trainer.GoalVAE.decode(state_enc)
                 state_dec_hist.append(state_dec)
-                goal_ent = torch.mean(goal_dist.entropy()).item()
-                episode_goal_ent.append(goal_ent)
                 goal_hist.append(goal.detach())
                 state_hist.append(model_state.detach())
                 obs_hist.append(torch.tensor(obs).float().unsqueeze(0))
@@ -224,11 +230,10 @@ def run(cfg):
                             [0, 1, 3]
                         ]  # breakout env has 4 channels, remove the "trail" channel for visualizations
 
-                action_dist = trainer.worker.get_action(
+                action, action_dist = trainer.worker.get_action(
                     model_state,
                     goal,
                 )
-                action = action_dist.sample()
 
                 if cfg.worker_cfg.action_noise:
                     action = action_noise(action, iter)
@@ -240,10 +245,11 @@ def run(cfg):
             score += rew
 
             goal_iteration += 1
+            trainer.buffer.add(obs, action.squeeze(0).cpu().numpy(), rew, done)
             if done:
                 train_episodes += 1
+                progress.update(goal_iteration)
                 goal_iteration = 0
-                trainer.buffer.add(obs, action.squeeze(0).cpu().numpy(), rew, done)
                 train_metrics["train_rewards"] = score
                 train_metrics["action_ent"] = np.mean(episode_actor_ent)
                 train_metrics["goal_ent"] = np.mean(episode_goal_ent)
@@ -258,6 +264,9 @@ def run(cfg):
                             + "4: Goal"
                         ),
                     )
+                progress.set_description(
+                    f"Training | Episode = {train_episodes} / Reward = {score} / Best = {best_mean_score:2.2f}"
+                )
                 wandb.log(train_metrics, step=train_episodes)
                 scores.append(score)
                 if len(scores) > 100:
@@ -265,9 +274,9 @@ def run(cfg):
                     current_average = np.mean(scores)
                     if current_average > best_mean_score:
                         best_mean_score = current_average
-                        print("saving best model with mean score : ", best_mean_score)
-                        # save_dict = trainer.get_save_dict()
-                        # torch.save(save_dict, best_save_path)
+                        tqdm.tqdm.write(f"Saving best model with mean score: {best_mean_score}")
+                        save_dict = trainer.get_save_dict()
+                        torch.save(save_dict, best_save_path)
 
                 obs, score = env.reset(), 0
                 done = False
@@ -276,9 +285,6 @@ def run(cfg):
                 episode_actor_ent = []
                 episode_goal_ent = []
             else:
-                trainer.buffer.add(
-                    obs, action.squeeze(0).detach().cpu().numpy(), rew, done
-                )
                 obs = next_obs
                 prev_rssmstate = posterior_rssm_state
                 prev_action = action

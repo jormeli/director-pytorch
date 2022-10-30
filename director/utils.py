@@ -85,7 +85,7 @@ class OneHot(nn.Module):
 
     def forward(self, logits: torch.Tensor) -> None:
         distribution = td.OneHotCategoricalStraightThrough(logits=logits)
-        return distribution
+        return distribution.rsample(), distribution
 
 
 class Normal(nn.Module):
@@ -144,8 +144,8 @@ def compute_returns(
     value: torch.Tensor,
     discount: torch.Tensor,
     bootstrap: torch.Tensor,
-    lambda_: float,
-) -> torch.Tensor:
+    lambda_: float
+):
     next_values = torch.cat([value[1:], bootstrap[None]], 0)
     target = reward + discount * next_values * (1 - lambda_)
     timesteps = list(range(reward.shape[0] - 1, -1, -1))
@@ -156,12 +156,5 @@ def compute_returns(
         discount_factor = discount[t]
         accumulated_reward = inp + discount_factor * lambda_ * accumulated_reward
         outputs.append(accumulated_reward)
-    returns = torch.cat(
-        [
-            torch.flip(torch.stack(outputs), [0]),
-            bootstrap.unsqueeze(0),
-        ],
-        dim=0,
-    )
-
+    returns = torch.flip(torch.stack(outputs), [0])
     return returns
