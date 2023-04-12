@@ -5,7 +5,9 @@ import os
 import torch
 import numpy as np
 import gym
-from PIL import Image
+from ray.rllib.env import VectorEnv
+from skimage.transform import resize as sk_resize
+from typing import Optional, Tuple
 
 from dreamerv2.utils.wrapper import (
     GymMinAtar,
@@ -21,12 +23,12 @@ from dreamerv2.training.config import MinAtarConfig
 from director.config import ExperimentConfig, Device
 from director.log import configure_logging
 from director.trainer import Trainer
-from director.utils import VectorOfCategoricals
 
 import hydra
 from omegaconf import OmegaConf
 from torchvision.utils import make_grid
 import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 pomdp_wrappers = {
     "breakout": breakoutPOMDP,
@@ -38,45 +40,82 @@ pomdp_wrappers = {
 
 
 class TransposeWrapper(gym.Wrapper):
-    def __init__(self, env):
+    def __init__(
+        self,
+        env,
+        resize: Optional[Tuple[int]] = None,
+    ):
         super().__init__(env)
         self.env = env
+        self.resize = resize
+        obs_shape = env.observation_space.shape
+        low, high = env.observation_space.low, env.observation_space.high
+        if len(obs_shape) < 3:
+            obs_shape = obs_shape + (1,)
+            low = low[..., None]
+            high = high[..., None]
+        if resize is not None:
+            obs_shape = tuple(self.resize) + (obs_shape[-1],)
+            low = sk_resize(low, resize)
+            high = sk_resize(high, resize)
+        self.observation_space = gym.spaces.Box(
+            low=low.transpose(2, 0, 1),
+            high=high.transpose(2, 0, 1),
+            shape=(obs_shape[-1],) + obs_shape[:-1],
+            dtype=env.observation_space.dtype,
+        )
 
     def _transform_obs(self, obs):
-        shape = obs.shape
-        img = Image.fromarray(obs)
-        img.thumbnail((shape[0] // 2, shape[1] // 2))
-        return np.asarray(img).transpose(2, 0, 1)
+        if len(obs.shape) < 3:
+            obs = obs[..., None]
+        if self.resize:
+            obs = sk_resize(obs, self.resize)
+        return obs.transpose(2, 0, 1)
 
     def step(self, *args, **kwargs):
-        next_state, reward, terminated, info, done = self.env.step(*args, **kwargs)
-        return (self._transform_obs(next_state), reward, done or terminated, info)
+        next_state, reward, done, info = self.env.step(*args, **kwargs)
+        return (self._transform_obs(next_state), reward, done, info)
 
     def reset(self, *args, **kwargs):
-        obs, info = self.env.reset(*args, **kwargs)
+        obs = self.env.reset(*args, **kwargs)
         return self._transform_obs(obs)
 
 
 def make_env(cfg):
-    if cfg.environment.startswith("minatar:"):
-        env_name = cfg.environment.split(":")[1]
-        # PomdpWrapper = pomdp_wrappers[env_name]
-        # env = PomdpWrapper(OneHotAction(GymMinAtar(env_name)))
-        env = OneHotAction(GymMinAtar(env_name))
-        obs_shape = env.observation_space.shape
-        action_size = env.action_space.shape[0]
-        obs_dtype = bool
-        action_dtype = np.float32
-    elif cfg.environment.startswith("gym:"):
-        env_name = cfg.environment.split(":")[1]
-        env = OneHotAction(TransposeWrapper(gym.make(env_name, continuous=False)))
-        action_size = env.action_space.shape[0]
-        # obs_shape = tuple(np.array(env.observation_space.shape)[[2,0,1]].tolist())
-        obs_shape = (3, 48, 48)
-        obs_dtype = env.observation_space.dtype
-        action_dtype = np.float32
+    def _create_minatar(env_name):
+        def _create_env(*args):
+            return OneHotAction(GymMinAtar(env_name))
 
-    return env, obs_shape, action_size, obs_dtype, action_dtype
+        return _create_env
+
+    if cfg.environment_cfg.name.startswith("minatar:"):
+        env_name = cfg.environment_cfg.name.split(":")[1]
+        env = VectorEnv.vectorize_gym_envs(
+            make_env=_create_minatar(env_name),
+            num_envs=cfg.environment_cfg.num_parallel_envs,
+        )
+        action_size = env.action_space.shape[0]
+        obs_shape = env.observation_space.shape
+    elif cfg.environment_cfg.name.startswith("gym:"):
+        def _create_env(*args, **kwargs):
+            return OneHotAction(
+                TransposeWrapper(
+                    gym.make(env_name, **cfg.environment_cfg.env_args),
+                    resize=cfg.environment_cfg.resize_obs,
+                )
+            )
+        env_name = cfg.environment_cfg.name.split(":")[1]
+        env = VectorEnv.vectorize_gym_envs(
+            make_env=_create_env,
+            num_envs=cfg.environment_cfg.num_parallel_envs,
+        )
+        action_size = env.action_space.shape[0]
+        if cfg.environment_cfg.observation_shape is not None:
+            obs_shape = tuple(cfg.environment_cfg.observation_shape)
+        else:
+            obs_shape = env.observation_space.shape
+
+    return env, action_size, obs_shape
 
 
 def action_noise(action, itr):
@@ -93,7 +132,7 @@ def action_noise(action, itr):
 def run(cfg):
     configure_logging(use_json=False)
     wandb.login()
-    env_name = cfg.environment
+    env_name = cfg.environment_cfg.name
     exp_id = datetime.now().isoformat() + "_pomdp"
 
     result_dir = os.path.join("results", "{}_{}".format(env_name, exp_id))
@@ -109,7 +148,8 @@ def run(cfg):
     device = torch.device(cfg.device)
     logging.info(f"Using device: {device}")
 
-    env, obs_shape, action_size, obs_dtype, action_dtype = make_env(cfg)
+    env, action_size, obs_shape = make_env(cfg)
+    num_parallel_envs = cfg.environment_cfg.num_parallel_envs
     batch_size = cfg.training_cfg.batch_size
     seq_len = cfg.training_cfg.sequence_length
 
@@ -117,8 +157,8 @@ def run(cfg):
         env=env_name,
         obs_shape=obs_shape,
         action_size=action_size,
-        obs_dtype=obs_dtype,
-        action_dtype=action_dtype,
+        obs_dtype=None,
+        action_dtype=None,
         seq_len=seq_len,
         batch_size=batch_size,
         model_dir=model_dir,
@@ -138,156 +178,154 @@ def run(cfg):
 
     with wandb.init(project="Director", config=config_dict):
         logging.info("Training...")
-        train_metrics = {}
         trainer.collect_seed_episodes(env)
-        obs, score = env.reset(), 0
-        done = False
-        prev_rssmstate = trainer.RSSM._init_rssm_state(1)
-        prev_action = torch.zeros(1, trainer.action_size).to(trainer.device)
-        episode_actor_ent = []
-        episode_goal_ent = []
+        obs, score = env.vector_reset(), np.zeros(num_parallel_envs)
+        prev_rssmstate = trainer.RSSM._init_rssm_state(num_parallel_envs)
+        prev_action = torch.zeros(num_parallel_envs, trainer.action_size).to(trainer.device)
         scores = []
-        best_mean_score = 0
+        best_mean_score = -1e10
         train_episodes = 0
-        goal_iteration = 0  # used to keep track of goal age between episode resets
+        goal_iteration = np.zeros((num_parallel_envs,), dtype=np.int32)
+        goal = torch.zeros(
+            num_parallel_envs,
+            config.rssm_info["deter_size"] + config.rssm_info["stoch_size"],
+        ).to(device)
 
         # Histories used for visualizations
-        goal_hist = []
-        state_hist = []
-        state_dec_hist = []
-        obs_hist = []
         grid = None
         progress = tqdm.tqdm(total=trainer.config.train_steps, desc="Training")
-
-        for iter in range(1, trainer.config.train_steps):
-            obs = obs.astype(np.float32)
-            if iter % cfg.training_cfg.train_every == 0:
-                train_metrics = trainer.train(train_metrics)
-            if (
-                iter
-                % (cfg.training_cfg.slow_target_update * cfg.training_cfg.train_every)
-                == 0
-            ):
-                trainer.update_target()
-            if (iter - 1) % cfg.training_cfg.save_every == 0:
-                trainer.save_model(iter)
-            with torch.no_grad():
-                embed = trainer.ObsEncoder(
-                    torch.tensor(obs, dtype=torch.float32)
-                    .unsqueeze(0)
-                    .to(trainer.device)
-                )
-                _, posterior_rssm_state = trainer.RSSM.rssm_observe(
-                    embed, prev_action, not done, prev_rssmstate
-                )
-                model_state = trainer.RSSM.get_model_state(posterior_rssm_state)
-                if goal_iteration % goal_duration == 0:
-                    goal, logits = trainer.manager.get_action(model_state)
-                    goal_dist = VectorOfCategoricals.get_dist(
-                        logits
-                    )  # used for logging
-                    goal, _ = trainer.GoalVAE.decode(goal)
-                    goal_ent = torch.mean(goal_dist.entropy()).item()
-                    episode_goal_ent.append(goal_ent)
-
-                # Used for logging
-                state_enc, _ = trainer.GoalVAE.encode(model_state)
-                state_dec, _ = trainer.GoalVAE.decode(state_enc)
-                state_dec_hist.append(state_dec)
-                goal_hist.append(goal.detach())
-                state_hist.append(model_state.detach())
-                obs_hist.append(torch.tensor(obs).float().unsqueeze(0))
-                if len(goal_hist) > 8:
-                    goal_hist.pop(0)
-                if len(state_hist) > 8:
-                    state_hist.pop(0)
-                if len(obs_hist) > 8:
-                    obs_hist.pop(0)
-                if len(state_dec_hist) > 8:
-                    state_dec_hist.pop(0)
-
-                if (iter - 1) % 100 == 0:
-                    # Log images
-                    trainer.ObsDecoder.eval()
-                    trainer.GoalVAE.eval()
-                    goal_img = trainer.ObsDecoder(torch.cat(goal_hist, dim=0)).mean
-                    goal_img_ = trainer.ObsDecoder(torch.cat(state_hist, dim=0)).mean
-                    goal_img__ = torch.cat(obs_hist, dim=0).to(trainer.device)
-                    goal_img___ = trainer.ObsDecoder(
-                        torch.cat(state_dec_hist, dim=0)
-                    ).mean
-                    trainer.ObsDecoder.train()
-                    trainer.GoalVAE.train()
-                    grid = make_grid(
-                        torch.cat(
-                            [goal_img__, goal_img_, goal_img___, goal_img], dim=0
-                        ),
-                        nrow=8,
-                        padding=2,
+        should_update_stats = False
+        with logging_redirect_tqdm():
+            for iter in range(1, trainer.config.train_steps):
+                train_metrics = {}
+                obs = np.array(obs).astype(np.float32)
+                if iter % cfg.training_cfg.train_every == 0:
+                    train_metrics = trainer.train(train_metrics)
+                    should_update_stats = True
+                if (
+                    iter
+                    % (cfg.training_cfg.slow_target_update * cfg.training_cfg.train_every)
+                    == 0
+                ):
+                    trainer.update_target()
+                if (iter - 1) % cfg.training_cfg.save_every == 0:
+                    trainer.save_model(iter)
+                with torch.no_grad():
+                    embed = trainer.ObsEncoder(
+                        torch.tensor(obs, dtype=torch.float32)
+                        .to(trainer.device)
                     )
-                    if grid.shape[0] > 3:
-                        grid = grid[
-                            [0, 1, 3]
-                        ]  # breakout env has 4 channels, remove the "trail" channel for visualizations
-
-                action, action_dist = trainer.worker.get_action(
-                    model_state,
-                    goal,
-                )
-
-                if cfg.worker_cfg.action_noise:
-                    action = action_noise(action, iter)
-
-                action_ent = torch.mean(action_dist.entropy()).item()
-                episode_actor_ent.append(action_ent)
-
-            next_obs, rew, done, _ = env.step(action.squeeze(0).cpu().numpy())
-            score += rew
-
-            goal_iteration += 1
-            trainer.buffer.add(obs, action.squeeze(0).cpu().numpy(), rew, done)
-            if done:
-                train_episodes += 1
-                progress.update(goal_iteration)
-                goal_iteration = 0
-                train_metrics["train_rewards"] = score
-                train_metrics["action_ent"] = np.mean(episode_actor_ent)
-                train_metrics["goal_ent"] = np.mean(episode_goal_ent)
-                train_metrics["train_steps"] = iter
-                if grid is not None and (train_episodes - 1) % 100 == 0:
-                    train_metrics["frames"] = wandb.Image(
-                        grid,
-                        caption=(
-                            "1: Observation, "
-                            + "2: Reconstructed observation, "
-                            + "3: Reconstructed GoalVAE observation, "
-                            + "4: Goal"
-                        ),
+                    _, posterior_rssm_state = trainer.RSSM.rssm_observe(
+                        embed, prev_action, True, prev_rssmstate
                     )
-                progress.set_description(
-                    f"Training | Episode = {train_episodes} / Reward = {score} / Best = {best_mean_score:2.2f}"
-                )
-                wandb.log(train_metrics, step=train_episodes)
-                scores.append(score)
-                if len(scores) > 100:
-                    scores.pop(0)
-                    current_average = np.mean(scores)
-                    if current_average > best_mean_score:
-                        best_mean_score = current_average
-                        tqdm.tqdm.write(f"Saving best model with mean score: {best_mean_score}")
-                        save_dict = trainer.get_save_dict()
-                        torch.save(save_dict, best_save_path)
+                    model_state = trainer.RSSM.get_model_state(posterior_rssm_state)
+                    goal_update_idxs = goal_iteration % goal_duration == 0
+                    if goal_update_idxs.sum() > 0:
+                        env_goal, _ = trainer.manager.get_action(
+                            model_state[goal_update_idxs]
+                        )
+                        env_goal, _ = trainer.GoalVAE.decode(env_goal)
+                        goal[goal_update_idxs] = env_goal
 
-                obs, score = env.reset(), 0
-                done = False
-                prev_rssmstate = trainer.RSSM._init_rssm_state(1)
-                prev_action = torch.zeros(1, trainer.action_size).to(trainer.device)
-                episode_actor_ent = []
-                episode_goal_ent = []
-            else:
-                obs = next_obs
-                prev_rssmstate = posterior_rssm_state
-                prev_action = action
+                    if (iter - 1) % 1000 == 0:
+                        # Log images
+                        trainer.ObsDecoder.eval()
+                        trainer.GoalVAE.eval()
+                        episode = trainer.buffer._storage[-1]
+                        observations = torch.tensor(episode["obs"][-8:]).float().to(trainer.device)
+                        trainer.ObsDecoder.train()
+                        trainer.GoalVAE.train()
+                        grid = make_grid(
+                            torch.cat(
+                                [
+                                    observations,
+                                ],
+                                dim=0
+                            ),
+                            nrow=8,
+                            padding=2,
+                        )
+                        if grid.shape[0] > 3:
+                            grid = grid[
+                                [0, 1, 3]
+                            ]  # breakout env has 4 channels, remove the "trail" channel for visualizations
+
+                    action, action_dist = trainer.worker.get_action(
+                        model_state,
+                        goal,
+                    )
+
+                next_obs, rew, done, _ = env.vector_step(
+                    action.cpu().numpy()
+                )
+                score += rew
+
+                goal_iteration += 1
+                for worker_id in range(num_parallel_envs):
+                    trainer.buffer.add(
+                        obs[worker_id],
+                        action[worker_id].cpu().numpy(),
+                        rew[worker_id],
+                        done[worker_id],
+                        worker_id
+                    )
+
+                for env_id in range(num_parallel_envs):
+                    if done[env_id]:
+                        should_update_stats = True
+                        progress.update(goal_iteration[env_id])
+                        goal_iteration[env_id] = 0
+                        w_obs = env.reset_at(env_id)
+                        obs[env_id] = w_obs
+                        new_rssm_state = trainer.RSSM._init_rssm_state(1)
+                        prev_rssmstate.mean[env_id] = new_rssm_state.mean[0]
+                        prev_rssmstate.std[env_id] = new_rssm_state.std[0]
+                        prev_rssmstate.stoch[env_id] = new_rssm_state.stoch[0]
+                        prev_rssmstate.deter[env_id] = new_rssm_state.deter[0]
+                        prev_action[env_id] = torch.zeros(trainer.action_size).to(trainer.device)
+                        train_episodes += 1
+                        train_metrics["train_rewards"] = max(
+                            score[env_id],
+                            train_metrics.get("train_rewards", score[env_id]),
+                        )
+                        train_metrics["train_steps"] = iter * num_parallel_envs
+                        train_metrics["train_episodes"] = train_episodes
+                        if grid is not None:
+                            train_metrics["frames"] = wandb.Image(
+                                grid,
+                                caption=(
+                                    "1: Observation, "
+                                    + "2: Reconstructed observation, "
+                                    + "3: Reconstructed GoalVAE observation, "
+                                    + "4: Goal"
+                                ),
+                            )
+                            grid = None
+
+                        progress.set_description(
+                            f"Training | Episode = {train_episodes} / Reward = {train_metrics['train_rewards']:.2f} / Best = {best_mean_score:2.2f}"
+                        )
+                        scores.append(score[env_id])
+                        score[env_id] = 0.
+                        if len(scores) > 100:
+                            scores.pop(0)
+                            current_average = np.mean(scores)
+                            if current_average > best_mean_score:
+                                best_mean_score = current_average
+                                logging.info(f"Saving best model with mean score: {best_mean_score}")
+                                save_dict = trainer.get_save_dict()
+                                torch.save(save_dict, best_save_path)
+                    else:
+                        obs[env_id] = next_obs[env_id]
+                        prev_rssmstate.mean[env_id] = posterior_rssm_state.mean[env_id]
+                        prev_rssmstate.std[env_id] = posterior_rssm_state.std[env_id]
+                        prev_rssmstate.stoch[env_id] = posterior_rssm_state.stoch[env_id]
+                        prev_rssmstate.deter[env_id] = posterior_rssm_state.deter[env_id]
+                        prev_action[env_id] = action[env_id]
+
+                    if should_update_stats:
+                        wandb.log(train_metrics, step=iter)
+                        should_update_stats = False
 
 
 @hydra.main(

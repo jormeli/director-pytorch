@@ -120,6 +120,9 @@ class EMA:
         self._loc = self._loc * (1 - alpha) + loc * alpha
         self._scale = self._scale * (1 - alpha) + scale * alpha
 
+    def normalize(self, tensor: torch.tensor):
+        return tensor / self.scale
+
 
 def max_cosine_similarity(
     inputs: torch.Tensor,

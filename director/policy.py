@@ -50,7 +50,7 @@ class Critic(nn.Module):
             value_target = lambda_returns.detach()
 
         value_dist = self.value(value_modelstates)
-        value_loss = -torch.mean(value_discount*value_dist.log_prob(value_target).unsqueeze(-1))
+        value_loss = -torch.mean(value_discount * value_dist.log_prob(value_target).unsqueeze(-1))
         return value_loss
 
     def update_target(self):
@@ -108,20 +108,24 @@ class Manager(nn.Module):
 
     def actor_loss(
         self,
-        lambda_returns: torch.Tensor,
+        ext_lambda_returns: torch.Tensor,
+        int_lambda_returns: torch.Tensor,
         discount_arr: torch.Tensor,
         policy_entropy: torch.Tensor,
-        imag_value: torch.Tensor,
+        ext_value: torch.Tensor,
+        int_value: torch.Tensor,
         imag_log_prob: torch.Tensor,
     ) -> torch.Tensor:
-        advantage = (lambda_returns-imag_value[:-1]).detach()
+        ext_advantage = (ext_lambda_returns - ext_value[:-1]).detach()
+        int_advantage = (int_lambda_returns - int_value[:-1]).detach()
+        advantage = ext_advantage + int_advantage * 0.1
         objective = imag_log_prob[1:].unsqueeze(-1) * advantage
 
         discount_arr = torch.cat([torch.ones_like(discount_arr[:1]), discount_arr[1:]])
         discount = torch.cumprod(discount_arr[:-1], 0)
         policy_entropy = policy_entropy[1:].unsqueeze(-1)
         actor_loss = -torch.sum(torch.mean(discount * (objective + self.actor_entropy_scale * policy_entropy), dim=1))
-        return actor_loss, discount, lambda_returns
+        return actor_loss, discount
 
     def extrinsic_critic_loss(
         self,
@@ -173,7 +177,7 @@ class Worker(nn.Module):
         )
 
         self.critic = Critic(
-            input_size=input_size,
+            input_size=input_size * 2,
             output_size=1,
             n_layers=n_layers,
             layer_size=layer_size,
@@ -188,7 +192,6 @@ class Worker(nn.Module):
         model_state: torch.Tensor,
         goal: torch.Tensor,
     ):
-        #return self.actor(model_state)
         return self.actor(torch.cat([model_state, goal], dim=-1))
 
     def value_loss(
@@ -211,7 +214,7 @@ class Worker(nn.Module):
         imag_value: torch.Tensor,
         imag_log_prob: torch.Tensor,
     ) -> torch.Tensor:
-        advantage = (lambda_returns-imag_value[:-1]).detach()
+        advantage = (lambda_returns - imag_value[:-1]).detach()
         objective = imag_log_prob[1:].unsqueeze(-1) * advantage
 
         discount_arr = torch.cat([torch.ones_like(discount_arr[:1]), discount_arr[1:]])

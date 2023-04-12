@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from hydra.core.config_store import ConfigStore
-from typing import Optional
+from typing import Optional, Tuple
 from enum import Enum
 
 
@@ -52,12 +52,21 @@ class TrainingConfig:
 
 
 @dataclass
+class EnvironmentConfig:
+    name: str
+    num_parallel_envs: int
+    env_args: Optional[dict]
+    resize_obs: Optional[Tuple[int]] = None
+    observation_shape: Optional[Tuple[int]] = None
+
+
+@dataclass
 class ExperimentConfig:
     training_cfg: TrainingConfig
     goal_vae_cfg: GoalAutoencoderConfig
     worker_cfg: WorkerConfig
     manager_cfg: ManagerConfig
-    environment: str
+    environment_cfg: EnvironmentConfig
     device: Device
     seed: Optional[int] = 609
 

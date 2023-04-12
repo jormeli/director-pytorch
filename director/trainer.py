@@ -4,11 +4,13 @@ import torch.optim as optim
 import os
 import logging
 
+from tqdm import tqdm
+
 from dreamerv2.utils.module import get_parameters, FreezeParameters
 from dreamerv2.models.dense import DenseModel
 from dreamerv2.models.rssm import RSSM
 from dreamerv2.models.pixel import ObsDecoder, ObsEncoder
-from dreamerv2.utils.buffer import TransitionBuffer
+from director.replay_buffer import ReplayBuffer
 from director.config import ExperimentConfig
 from director.policy import Manager, Worker
 from director.goal_autoencoder import GoalAutoencoder
@@ -56,23 +58,29 @@ class Trainer(object):
 
     def collect_seed_episodes(self, env):
         logging.info("Collecting seed steps...")
-        s, done = env.reset(), False
-        for i in range(self.seed_steps):
-            a = env.action_space.sample()
-            ns, r, done, _ = env.step(a)
-            if done:
-                self.buffer.add(s, a, r, done)
-                s, done = env.reset(), False
-            else:
-                self.buffer.add(s, a, r, done)
-                s = ns
+        s = env.vector_reset()
+        progress = tqdm(total=self.cfg.training_cfg.seed_steps, desc="Collecting seed steps")
+        while self.buffer._len < self.cfg.training_cfg.seed_steps:
+            a = [
+                env.action_space.sample()
+                for _ in range(self.cfg.environment_cfg.num_parallel_envs)
+            ]
+            ns, r, done, _ = env.vector_step(a)
+            for w_id in range(self.cfg.environment_cfg.num_parallel_envs):
+                self.buffer.add(s[w_id].astype(np.float32), a[w_id], r[w_id], done[w_id], w_id)
+                if done[w_id]:
+                    s[w_id] = env.reset_at(w_id)
+                else:
+                    s[w_id] = ns[w_id]
+            progress.update(self.cfg.environment_cfg.num_parallel_envs)
+
+        self.buffer.ongoing_episodes.clear()
+        logging.info("Done.")
 
     def train(self, train_metrics):
         _model_loss = []
         _goal_vae_loss = []
         _manager_actor_loss = []
-        _manager_ext_loss = []
-        _manager_int_loss = []
         _worker_actor_loss = []
         _worker_value_loss = []
         _worker_reward = []
@@ -80,16 +88,16 @@ class Trainer(object):
         _goal_norms = []
         _imag_modelstate_norms = []
         for i in range(1):
-            obs, actions, rewards, terms = self.buffer.sample()
-            obs = torch.tensor(obs, dtype=torch.float32).to(self.device)  # t, t+seq_len
-            actions = torch.tensor(actions, dtype=torch.float32).to(
+            sample = self.buffer.sample_batch(self.config.batch_size, self.config.seq_len)
+            obs = torch.tensor(sample["obs"], dtype=torch.float32).to(self.device)  # t, t+seq_len
+            actions = torch.tensor(sample["actions"], dtype=torch.float32).to(
                 self.device
             )  # t-1, t+seq_len-1
             rewards = (
-                torch.tensor(rewards, dtype=torch.float32).to(self.device).unsqueeze(-1)
+                torch.tensor(sample["rewards"], dtype=torch.float32).to(self.device).unsqueeze(-1)
             )  # t-1 to t+seq_len-1
             nonterms = (
-                torch.tensor(1 - terms, dtype=torch.float32)
+                torch.tensor(1 - sample["dones"], dtype=torch.float32)
                 .to(self.device)
                 .unsqueeze(-1)
             )  # t-1 to t+seq_len-1
@@ -140,49 +148,34 @@ class Trainer(object):
             )
             self.goal_vae_optimizer.step()
             _goal_vae_loss.append(goal_loss.detach().cpu().item())
-            #(
-            #    manager_ext_loss,
-            #    manager_int_loss,
-            #    manager_actor_loss,
-            #    worker_value_loss,
-            #    worker_actor_loss,
-            #    worker_reward,
-            #    goals,
-            #    imag_modelstates,
-            #) = self.director_actorcritic_loss(posterior)
             (
                 worker_actor_loss,
                 worker_value_loss,
                 manager_actor_loss,
-                manager_value_loss,
+                manager_ext_loss,
+                manager_int_loss,
                 worker_reward,
+                extrinsic_returns,
+                intrinsic_returns,
             ) = self.director_loss(posterior)
-            _manager_ext_loss.append(manager_value_loss.detach().cpu().item())
-            #if self.cfg.manager_cfg.intrinsic_reward:
-            #    _manager_int_loss.append(manager_int_loss.detach().cpu().item())
             _manager_actor_loss.append(manager_actor_loss.detach().cpu().item())
             _worker_actor_loss.append(worker_actor_loss.detach().cpu().item())
             _worker_value_loss.append(worker_value_loss.detach().cpu().item())
             _worker_reward.append(worker_reward.detach().cpu().sum(dim=0).mean().item())
-            #_goal_norms.append(torch.norm(goals, dim=-1).mean().cpu().item())
-            #_imag_modelstate_norms.append(
-            #    torch.norm(imag_modelstates, dim=-1).mean().cpu().item()
-            #)
 
             self.manager_ext_value_optimizer.zero_grad()
-            manager_value_loss.backward()
+            manager_ext_loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 self.manager.extrinsic_critic.parameters(), self.grad_clip_norm
             )
             self.manager_ext_value_optimizer.step()
 
-            #if self.cfg.manager_cfg.intrinsic_reward:
-            #    self.manager_int_value_optimizer.zero_grad()
-            #    manager_int_loss.backward()
-            #    torch.nn.utils.clip_grad_norm_(
-            #        self.manager.intrinsic_critic.parameters(), self.grad_clip_norm
-            #    )
-            #    self.manager_int_value_optimizer.step()
+            self.manager_int_value_optimizer.zero_grad()
+            manager_int_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.manager.intrinsic_critic.parameters(), self.grad_clip_norm
+            )
+            self.manager_int_value_optimizer.step()
 
             self.manager_actor_optimizer.zero_grad()
             manager_actor_loss.backward()
@@ -208,21 +201,22 @@ class Trainer(object):
         train_metrics["model_loss"] = np.mean(np.array(_model_loss))
         train_metrics["goal_vae_loss"] = np.mean(_goal_vae_loss)
         train_metrics["manager_actor_loss"] = np.mean(_manager_actor_loss)
-        train_metrics["manager_ext_loss"] = np.mean(_manager_ext_loss)
-        if self.cfg.manager_cfg.intrinsic_reward:
-            train_metrics["manager_int_loss"] = np.mean(_manager_int_loss)
+        train_metrics["manager_ext_loss"] = manager_ext_loss.cpu().mean().item()
+        train_metrics["manager_int_loss"] = manager_int_loss.cpu().mean().item()
         train_metrics["worker_actor_loss"] = np.mean(_worker_actor_loss)
         train_metrics["worker_value_loss"] = np.mean(_worker_value_loss)
         train_metrics["obs_loss"] = np.mean(_obs_loss)
         train_metrics["worker_reward"] = np.mean(_worker_reward)
         train_metrics["imag_model_state_norm"] = np.mean(_imag_modelstate_norms)
         train_metrics["goal_norm"] = np.mean(_goal_norms)
+        train_metrics["extrinsic_returns"] = np.mean(extrinsic_returns.item())
+        train_metrics["intrinsic_returns"] = np.mean(intrinsic_returns.item())
 
         return train_metrics
 
     def rollout_imagination(
         self,
-        horizon:int,
+        horizon: int,
         prev_rssm_state,
     ):
         def _get_goal(model_state):
@@ -282,7 +276,7 @@ class Trainer(object):
     def director_loss(self, posterior):
         with torch.no_grad():
             batched_posterior = self.RSSM.rssm_detach(
-                self.RSSM.rssm_seq_to_batch(posterior, self.batch_size, self.seq_len-1)
+                self.RSSM.rssm_seq_to_batch(posterior, self.batch_size, self.seq_len - 1)
             )
 
         with FreezeParameters(self.world_list):
@@ -304,43 +298,92 @@ class Trainer(object):
             dim=0,
         )[::self.goal_duration]
 
-        with FreezeParameters(self.world_list+self.value_list+[self.DiscountModel]):
+        with FreezeParameters(self.world_list + self.value_list + [self.DiscountModel]):
             imag_reward_dist = self.RewardDecoder(imag_modelstates)
             imag_reward = imag_reward_dist.mean
-            worker_value_dist = self.worker.critic.target_value(imag_modelstates)
-            worker_value = worker_value_dist.mean
-            manager_value = self.manager.extrinsic_critic.target_value(manager_modelstates).mean
-            manager_reward = torch.cat(
+            worker_value = self.worker.critic.target_value(
+                torch.cat(
+                    [
+                        imag_modelstates[:-1],
+                        goals[1:],
+                    ],
+                    dim=-1,
+                )
+            ).mean
+            manager_ext_value = self.manager.extrinsic_critic.target_value(manager_modelstates).mean
+            manager_int_value = self.manager.intrinsic_critic.target_value(manager_modelstates).mean
+            extrinsic_reward = torch.cat(
                 [
                     chunk.sum(dim=0, keepdim=True)
                     for chunk in torch.split(imag_reward, self.goal_duration, dim=0)
                 ],
                 dim=0,
             )
-            manager_goals = goals[::self.goal_duration]
             goal_entropy = goal_entropies[::self.goal_duration]
             goal_log_prob = goal_log_probs[::self.goal_duration]
             discount_dist = self.DiscountModel(imag_modelstates)
-            discount_arr = self.discount*torch.round(discount_dist.base_dist.probs)  #mean = prob(disc==1)
+            discount_arr = self.discount * torch.round(discount_dist.base_dist.probs)
 
-        lambda_returns = compute_returns(
-            manager_reward[:-1],
-            manager_value[:-1],
+            reconstructed_modelstates, _ = self.GoalVAE.decode(
+                self.GoalVAE.encode(imag_modelstates)[0]
+            )
+            reconstruction_loss = torch.mean(
+                (reconstructed_modelstates - imag_modelstates) ** 2,
+                dim=-1,
+                keepdim=True,
+            )
+            intrinsic_reward = torch.cat(
+                [
+                    chunk.sum(dim=0, keepdim=True)
+                    for chunk in torch.split(reconstruction_loss, self.goal_duration, dim=0)
+                ],
+                dim=0,
+            )
+
+        ext_lambda_returns = compute_returns(
+            extrinsic_reward[:-1],
+            manager_ext_value[:-1],
             discount_arr[::self.goal_duration][:-1],
-            bootstrap=manager_value[-1],
+            bootstrap=manager_ext_value[-1],
             lambda_=self.lambda_,
         )
-        manager_actor_loss, _, _ = self.manager.actor_loss(
-            lambda_returns,
+        int_lambda_returns = compute_returns(
+            intrinsic_reward[:-1],
+            manager_int_value[:-1],
+            discount_arr[::self.goal_duration][:-1],
+            bootstrap=manager_int_value[-1],
+            lambda_=self.lambda_,
+        )
+        self.manager_ext_ema.update(
+            torch.std(ext_lambda_returns.view(-1), dim=0).detach().item(),
+            ext_lambda_returns.mean().detach().item(),
+        )
+        self.manager_int_ema.update(
+            torch.std(int_lambda_returns.view(-1), dim=0).detach().item(),
+            int_lambda_returns.mean().detach().item(),
+        )
+        ext_lambda_returns = self.manager_ext_ema.normalize(ext_lambda_returns)
+        int_lambda_returns = self.manager_int_ema.normalize(int_lambda_returns)
+        manager_ext_value = self.manager_ext_ema.normalize(manager_ext_value)
+        manager_int_value = self.manager_int_ema.normalize(manager_int_value)
+        manager_actor_loss, _ = self.manager.actor_loss(
+            ext_lambda_returns,
+            int_lambda_returns,
             discount_arr[::self.goal_duration],
             goal_entropy,
-            manager_value,
+            manager_ext_value,
+            manager_int_value,
             goal_log_prob,
         )
-        manager_value_loss = self.manager.extrinsic_critic.loss(
+        manager_ext_loss = self.manager.extrinsic_critic.loss(
             manager_modelstates,
             discount_arr[::self.goal_duration],
-            lambda_returns,
+            ext_lambda_returns,
+        )
+        manager_int_loss = self.manager.intrinsic_critic.loss(
+            manager_modelstates,
+            discount_arr[::self.goal_duration],
+            int_lambda_returns,
         )
 
         worker_actor_losses = []
@@ -352,23 +395,29 @@ class Trainer(object):
         for t in range(0, self.horizon, self.goal_duration):
             _slice = slice(t, t + self.goal_duration)
             lambda_returns = compute_returns(
-                worker_reward[_slice][:-1],  # + imag_reward[_slice][:-1] * 0.1,
+                worker_reward[:-1][_slice][:-1],
                 worker_value[_slice][:-1],
-                discount_arr[_slice][:-1],
+                discount_arr[:-1][_slice][:-1],
                 bootstrap=worker_value[_slice][-1],
                 lambda_=self.lambda_,
             )
             actor_loss, _, _ = self.worker.actor_loss(
                 lambda_returns,
-                discount_arr[_slice],
-                policy_entropy[_slice],
+                discount_arr[:-1][_slice],
+                policy_entropy[:-1][_slice],
                 worker_value[_slice],
-                imag_log_prob[_slice],
+                imag_log_prob[:-1][_slice],
             )
             worker_actor_losses.append(actor_loss)
             value_loss = self.worker.critic.loss(
-                imag_modelstates[_slice],
-                discount_arr[_slice],
+                torch.cat(
+                    [
+                        imag_modelstates[:-1],
+                        goals[1:],
+                    ],
+                    dim=-1,
+                )[_slice],
+                discount_arr[:-1][_slice],
                 lambda_returns,
             )
             worker_value_losses.append(value_loss)
@@ -377,8 +426,11 @@ class Trainer(object):
             sum(worker_actor_losses),
             sum(worker_value_losses),
             manager_actor_loss,
-            manager_value_loss,
+            manager_ext_loss,
+            manager_int_loss,
             worker_reward,
+            ext_lambda_returns.mean().detach(),
+            int_lambda_returns.mean().detach(),
         )
 
     # Copied from the DreamerV2 implementation
@@ -492,9 +544,10 @@ class Trainer(object):
         self.ObsEncoder.load_state_dict(saved_dict["ObsEncoder"])
         self.ObsDecoder.load_state_dict(saved_dict["ObsDecoder"])
         self.RewardDecoder.load_state_dict(saved_dict["RewardDecoder"])
-        self.ActionModel.load_state_dict(saved_dict["ActionModel"])
-        self.ValueModel.load_state_dict(saved_dict["ValueModel"])
         self.DiscountModel.load_state_dict(saved_dict["DiscountModel"])
+        self.manager.load_state_dict(saved_dict["Manager"])
+        self.worker.load_state_dict(saved_dict["Worker"])
+        self.GoalVAE.load_state_dict(saved_dict["GoalVAE"])
 
     def _model_initialize(self, config):
         obs_shape = config.obs_shape
@@ -511,15 +564,7 @@ class Trainer(object):
         rssm_node_size = config.rssm_node_size
         modelstate_size = stoch_size + deter_size
 
-        self.buffer = TransitionBuffer(
-            config.capacity,
-            obs_shape,
-            action_size,
-            config.seq_len,
-            config.batch_size,
-            config.obs_dtype,
-            config.action_dtype,
-        )
+        self.buffer = ReplayBuffer(config.capacity)
         self.RSSM = RSSM(
             action_size,
             rssm_node_size,
